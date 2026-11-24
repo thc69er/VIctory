@@ -75,6 +75,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(test)]
+mod atomic64_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -159,6 +161,22 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// The optional host features the shader needs (its `SFI0` bits).
+    pub fn features(&self) -> u64 {
+        Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| c.part(FourCC::SFI0).map(|p| p.data))
+            .and_then(|d| d.get(..8))
+            .map_or(0, |d| u64::from_le_bytes(d.try_into().unwrap_or_default()))
+    }
+
+    /// Whether the shader does 64-bit atomics on typed views from the
+    /// descriptor heap (`D3D12_OPTIONS9` and `D3D12_OPTIONS11` support).
+    pub fn typed_atomics64(&self) -> bool {
+        use shader::features::{ATOMIC_INT64_HEAP, ATOMIC_INT64_TYPED};
+        self.features() & (ATOMIC_INT64_TYPED | ATOMIC_INT64_HEAP) != 0
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {

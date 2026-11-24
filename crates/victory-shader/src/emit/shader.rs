@@ -20,8 +20,18 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
+}
+
+/// `SFI0` feature bits a host device must support for a shader to load.
+pub mod features {
+    /// `D3D_SHADER_REQUIRES_ATOMIC_INT64_ON_TYPED_RESOURCE`.
+    pub const ATOMIC_INT64_TYPED: u64 = 0x40_0000;
+    /// `D3D_SHADER_REQUIRES_ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE`.
+    pub const ATOMIC_INT64_HEAP: u64 = 0x1000_0000;
 }
 
 pub(crate) struct Types {
@@ -577,6 +587,12 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
+            features |= features::ATOMIC_INT64_TYPED;
+        }
+        if self.flags & flags::ATOMIC_INT64_HEAP != 0 {
+            features |= features::ATOMIC_INT64_HEAP;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

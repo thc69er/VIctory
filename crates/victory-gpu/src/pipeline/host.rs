@@ -323,10 +323,17 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        let mut atomics64 = false;
         for (s, _) in &stages {
-            s.translated()?;
+            atomics64 |= s.translated()?.host.typed_atomics64();
         }
         let host = host()?;
+        if atomics64 && !host.typed_atomics64() {
+            return refuse(
+                "the host GPU has no 64-bit atomics on typed descriptor-heap views",
+                shaders,
+            );
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();

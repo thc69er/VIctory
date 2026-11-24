@@ -173,7 +173,9 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Heap handles made in a block, by descriptor load and both words of
+    /// their properties: one view read as f32x4 and as u64 needs two.
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -337,6 +339,10 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         })
         .collect()
 }
+
+/// A heap handle's block, descriptor load (site and first dword), whether
+/// it names a sampler, and its properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
@@ -3308,7 +3314,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5673,12 +5679,15 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            let cmpswap = code == u32::MAX;
+            // dmask: the data dwords (cmpswap: twice the value's). Two per
+            // value is a 64-bit atomic on an R32G32 integer view, which the
+            // host reads as one 64-bit channel (uint64 typed UAV, SM 6.6).
+            let wide = match (*dmask, cmpswap) {
+                (1, false) | (3, true) => false,
+                (3, false) | (0xF, true) => true,
+                _ => return Err("an image atomic of these channels"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5687,29 +5696,60 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let per = if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, data, if cmpswap { 2 * per } else { per })?;
+            let (ty, zero) = if wide {
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
+                (i64t, self.s.m.int_const(i64t, 0))
+            } else {
+                (self.s.t.i32, self.s.m.i32(0))
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            // Value k of the data: one VGPR, or a pair, low dword first.
+            let value_at = |l: &mut Self, k: usize| -> V {
+                if !wide {
+                    return vals[k];
+                }
+                let c = l.cur;
+                let lo = l.s.m.cast(c, Cast::ZExt, vals[2 * k], ty);
+                let hi = l.s.m.cast(c, Cast::ZExt, vals[2 * k + 1], ty);
+                let k32 = l.s.m.int_const(ty, 32);
+                let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+                l.s.m.bin(c, Bin::Or, lo, hi)
+            };
+            let mut value = value_at(self, 0);
+            let compare = if cmpswap { value_at(self, 1) } else { zero };
+            if op == "sub" {
+                value = self.s.m.bin(c, Bin::Sub, zero, value);
+            }
+            let old = match (inst.read(Reg::V(reg)), cache.glc) {
+                (Some(lo), true) if wide => {
+                    let hi = inst.read(Reg::V(reg + 1)).ok_or("image atomic data")?;
+                    let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                    let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
+                    let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
+                    let k32 = self.s.m.int_const(ty, 32);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                (Some(v), true) => self.i32_of(v)?,
+                _ => zero,
+            };
+            // Typed properties: component type U32 (5) or U64 (7), one channel.
+            let comp = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, comp))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let overload = if wide { "i64" } else { "i32" };
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if cmpswap {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([compare, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{overload}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
@@ -5717,12 +5757,24 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{overload}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
